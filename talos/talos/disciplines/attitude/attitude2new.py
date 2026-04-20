@@ -2,6 +2,7 @@ import csdl_alpha as csdl
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Attitude2new.py defines attitude dynamics of spacecraft in orbit, includes effects of gravity gradient torque, integrates in time, plots results for nutation angles and angular velocity
 def attitude_dynamics(omega, B, K, Omega):
     # Euler's equations - gravity gradient torque
     # First term (K[0] * omega[1] * omega[2]) is the gyroscopic term, second term is the gravity gradient torque

@@ -5,7 +5,7 @@ from csdl import Model
 import csdl
 import numpy as np
 
-
+3 # Attitude.py defines an attitude optimization problem for a spacecraft in orbit, using reaction wheels for control, includes effects of gravity gradient torque, integrated in time, and includes constraints on reaction wheel torque and speed, with design variables for the attitude trajectory and initial reaction wheel speeds, and uses CSDL for automatic differentiation and optimization
 class OrbitBodyReferenceFrameChange(Model):
 
     def initialize(self):
