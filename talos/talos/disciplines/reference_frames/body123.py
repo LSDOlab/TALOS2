@@ -1,6 +1,5 @@
 import csdl_alpha as csdl
 import numpy as np
-
 # Update for new CSDL version, using csdl.Variable instead of self.declare_variable, and using csdl.slice to build up the output variable slot by slot, since CSDL needs to track each assignment to the variable
 def body123_reference_frame_change(yaw, pitch, roll, num_times):
     # Computes 123 rotation matrix C, (shape 3, 3, num_times) describing how to express coordinates in the body frame that were originally defined in the ECI (Earth Centered Inertial) frame, given time histories of yaw, pitch, and roll angles (shape (num_times, ))
