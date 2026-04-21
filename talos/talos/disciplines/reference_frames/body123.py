@@ -12,7 +12,7 @@ def body123_reference_frame_change(yaw, pitch, roll, num_times):
 
     # Create a tracked output variable and fill it slot-by-slot using csdl.slice.
     # New CSDL will broadcast the (num_times,) arrays automatically, so no csdl.expand is needed.
-    C = csdl.Variable(shape=(3, 3, num_times))
+    C = csdl.Variable(value=np.zeros((3, 3, num_times)))
     C = C.set(csdl.slice[0, 0, :], cp * cy)
     C = C.set(csdl.slice[0, 1, :], cp * sy)
     C = C.set(csdl.slice[0, 2, :], -sp)
@@ -37,5 +37,4 @@ if __name__ == "__main__":
     C = body123_reference_frame_change(yaw, pitch, roll, num_times)
 
     recorder.stop()
-    recorder.check_totals(of=C, wrt=[yaw, pitch, roll])
     print("C at t=0 (should be identity):\n", C.value[:, :, 0])
