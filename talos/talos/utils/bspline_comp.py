@@ -109,8 +109,10 @@ if __name__ == "__main__":
 
     recorder.stop()
 
-    # sim = csdl.experimental.JaxSimulator(recorder=recorder)
-    # sim.run()
+    sim = csdl.experimental.JaxSimulator(recorder=recorder)
+    sim.run()
     # sim.check_totals()
+    sim.compute_totals(pt_sum, inputs.cp)
+
     print("B-spline output shape:", pt.value.shape)
     print("First 5 values:", pt.value[:5])
