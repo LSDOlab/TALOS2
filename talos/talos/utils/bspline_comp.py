@@ -88,6 +88,8 @@ class BsplineComp(csdl.CustomExplicitOperation):
 
 
 if __name__ == "__main__":
+   # this is a simple test of the BsplineComp, which creates a random set of control points, computes the corresponding points using the B-spline, and checks that the output has the expected shape and values.
+   #  It also computes the total of the points and sets it as an objective, then runs a JaxSimulator to compute derivatives with respect to the control points.
     num_cp = 10
     num_pt = 100
 
@@ -108,11 +110,11 @@ if __name__ == "__main__":
     pt_sum.add_name('pt_sum')
 
     recorder.stop()
-
     sim = csdl.experimental.JaxSimulator(recorder=recorder)
     sim.run()
     # sim.check_totals()
-    sim.compute_totals(pt_sum, inputs.cp)
+    dpctdp = sim.compute_totals()[pt_sum, inputs.cp]
+    print(dpctdp)
 
     print("B-spline output shape:", pt.value.shape)
     print("First 5 values:", pt.value[:5])

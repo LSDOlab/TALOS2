@@ -1,327 +1,182 @@
-from ozone.api import ODEProblem
-from csdl.utils.get_bspline_mtx import get_bspline_mtx
-from talos.disciplines.reference_frames.body123 import Body123ReferenceFrameChange
-from csdl import Model
-import csdl
+import csdl_alpha as csdl
 import numpy as np
-
-3 # Attitude.py defines an attitude optimization problem for a spacecraft in orbit, using reaction wheels for control, includes effects of gravity gradient torque, integrated in time, and includes constraints on reaction wheel torque and speed, with design variables for the attitude trajectory and initial reaction wheel speeds, and uses CSDL for automatic differentiation and optimization
-def orbit_body_reference_frame_change(RTN_from_ECI, B_from_ECI, num_times, step_size):
-        ECI_from_RTN = csdl.reorder_axes(RTN_from_ECI, 'ijk->jik')
-        B_from_RTN = csdl.einsum(B_from_ECI, ECI_from_RTN, subscripts='ijl,jkl->ikl')
-        # Rate of change of Reference frame transformation
-        B_from_ECI_dot = csdl.Variable(value = np.zeros((3, 3, num_times)))
-        # Next - current time step, divided by step_size gives rate of change
-        B_from_ECI_dot = B_from_ECI_dot.set(csdl.slice[:, :, 1:], (B_from_ECI[:, :, :1] - B_from_ECI[:, :, :-1]) / step_size
-        )
-        return B_from_RTN, B_from_ECI_dot
+from talos.utils.bspline_comp import BsplineComp, get_bspline_mtx
+from talos.disciplines.reference_frames.body123 import body123_reference_frame_change
+from talos.disciplines.attitude.orbit_body_reference_frame import orbit_body_reference_frame_change
 
 
-class BodyRates(Model):
+def body_rates(B_from_ECI, B_from_ECI_dot, osculating_orbit_angular_speed,
+               sc_mmoi, step_size, num_times, gravity_gradient, B_from_RTN=None):
+    # Angular velocity via skew-symmetric cross operator: wcross = B_dot @ B^T
+    wcross = csdl.einsum(
+        B_from_ECI_dot,
+        csdl.einsum(B_from_ECI, action='ijk->jik'),
+        action='ijl,jkl->ikl')
 
-    def initialize(self):
-        self.parameters.declare('num_times', types=int)
-        self.parameters.declare('sc_mmoi', types=np.ndarray)
-        self.parameters.declare('step_size', types=float)
-        self.parameters.declare('gravity_gradient', types=bool)
+    # Extract angular velocity components from skew-symmetric matrix
+    rates = csdl.Variable(value=np.zeros((num_times, 3)))
+    rates = rates.set(csdl.slice[:, 0], wcross[2, 1, :])
+    rates = rates.set(csdl.slice[:, 1], wcross[0, 2, :])
+    rates = rates.set(csdl.slice[:, 2], wcross[1, 0, :])
 
-    def define(self):
-        num_times = self.parameters['num_times']
-        sc_mmoi = self.parameters['sc_mmoi']
-        step_size = self.parameters['step_size']
-        gravity_gradient = self.parameters['gravity_gradient']
+    # Angular acceleration via finite differences
+    accels = csdl.Variable(value=np.zeros((num_times, 3)))
+    accels = accels.set(
+        csdl.slice[1:, :],
+        (rates[1:, :] - rates[:-1, :]) / step_size
+    )
 
-        osculating_orbit_angular_speed = self.declare_variable(
-            'osculating_orbit_angular_speed',
-            shape=(1, num_times),
-        )
+    # Jw = angular momentum = J * omega
+    Jw = rates * np.einsum('i,j->ij', np.ones(num_times), sc_mmoi)
 
-        B_from_ECI = self.declare_variable(
-            'B_from_ECI',
-            shape=(3, 3, num_times),
-        )
-        B_from_ECI_dot = self.declare_variable(
-            'B_from_ECI_dot',
-            shape=(3, 3, num_times),
-        )
-        # Angular velocity of spacecraft in inertial frame
-        # (skew symmetric cross operator)
-        wcross = csdl.einsum(
-            B_from_ECI_dot,
-            # transpose
-            csdl.einsum(B_from_ECI, subscripts='ijk->jik'),
-            subscripts='ijl,jkl->ikl')
-        body_rates = self.create_output('body_rates', shape=(num_times, 3))
-        body_rates[:, 0] = csdl.reshape(wcross[2, 1, :], (num_times, 1))
-        body_rates[:, 1] = csdl.reshape(wcross[0, 2, :], (num_times, 1))
-        body_rates[:, 2] = csdl.reshape(wcross[1, 0, :], (num_times, 1))
+    # bt1 = J * alpha (inertial torque)
+    bt1 = csdl.Variable(value=np.zeros((num_times, 3)))
+    bt1 = bt1.set(csdl.slice[:, 0], sc_mmoi[0] * accels[:, 0])
+    bt1 = bt1.set(csdl.slice[:, 1], sc_mmoi[1] * accels[:, 1])
+    bt1 = bt1.set(csdl.slice[:, 2], sc_mmoi[2] * accels[:, 2])
 
-        # Angular acceleration of spacecraft in inertial frame, compute
-        # via finite differences
-        body_accels = self.create_output(
-            'body_accels',
-            val=0,
-            shape=(num_times, 3),
-        )
-        body_accels[1:, :] = (body_rates[1:, :] -
-                              body_rates[:-1, :]) / step_size
+    # bt2 = omega x (J * omega) (gyroscopic torque)
+    bt2 = csdl.cross(rates, Jw, axis=1)
 
-        Jw = body_rates * np.einsum('i,j->ij', np.ones(num_times), sc_mmoi)
-        bt1 = self.create_output('bt1', shape=(num_times, 3))
-        bt1[:, 0] = sc_mmoi[0] * body_accels[:, 0]
-        bt1[:, 1] = sc_mmoi[1] * body_accels[:, 1]
-        bt1[:, 2] = sc_mmoi[2] * body_accels[:, 2]
+    # B_from_RTN is the rotation matrix that transforms vectors from the RTN to Body frame
+    # RTN - Radial points away from Earth, Tangential points in the direction of motion along orbit, Normal points perpendicularly to the orbital plane
+    # Gravity gradient torque arises from the non-uniform gravity field of Earth
+    # T = -3 * (I2 - I3) * B_from_RTN[1,0] * B_from_RTN[2,0] * n^2 for x-axis
+    # where n is the orbital angular velocity, with cyclic permutations for y and z axes
+    if gravity_gradient is True:
+        bt3 = csdl.Variable(value=np.zeros((3, num_times)))
+        bt3 = bt3.set(csdl.slice[0, :],
+            -3 * (sc_mmoi[1] - sc_mmoi[2]) * B_from_RTN[1, 0, :] * B_from_RTN[2, 0, :] * osculating_orbit_angular_speed[0, :]**2)
+        bt3 = bt3.set(csdl.slice[1, :],
+            -3 * (sc_mmoi[2] - sc_mmoi[0]) * B_from_RTN[2, 0, :] * B_from_RTN[0, 0, :] * osculating_orbit_angular_speed[0, :]**2)
+        bt3 = bt3.set(csdl.slice[2, :],
+            -3 * (sc_mmoi[0] - sc_mmoi[1]) * B_from_RTN[0, 0, :] * B_from_RTN[1, 0, :] * osculating_orbit_angular_speed[0, :]**2)
+        body_torque = bt1 + bt2 + csdl.reorder_axes(bt3, 'ij->ji')
+    else:
+        body_torque = bt1 + bt2
 
-        bt2 = csdl.cross(body_rates, Jw, axis=1)
-        if gravity_gradient is True:
-            # Terms associated with orientation of spacecraft used to
-            # compute effect of gravity field on spacecraft angular momentum
-            # over time
-            bt3 = self.create_output('gravity_term', shape=(3, num_times))
-            # bt3[0, :] = -3 * (sc_mmoi[1] - sc_mmoi[2]) * (csdl.reshape(
-            #     B_from_RTN[0, 1, :] * B_from_RTN[0, 2, :],
-            #     (1, num_times)) * osculating_orbit_angular_speed**2)
-            # bt3[1, :] = -3 * (sc_mmoi[2] - sc_mmoi[0]) * (csdl.reshape(
-            #     B_from_RTN[0, 2, :] * B_from_RTN[0, 0, :],
-            #     (1, num_times)) * osculating_orbit_angular_speed**2)
-            # bt3[2, :] = -3 * (sc_mmoi[0] - sc_mmoi[1]) * (csdl.reshape(
-            #     B_from_RTN[0, 0, :] * B_from_RTN[0, 1, :],
-            #     (1, num_times)) * osculating_orbit_angular_speed**2)
-
-            # use transpose of B_from_RTN
-            B_from_RTN = self.declare_variable('B_from_RTN',
-                                               shape=(3, 3, num_times))
-            bt3[0, :] = -3 * (sc_mmoi[1] - sc_mmoi[2]) * (csdl.reshape(
-                B_from_RTN[1, 0, :] * B_from_RTN[2, 0, :],
-                (1, num_times)) * osculating_orbit_angular_speed**2)
-            bt3[1, :] = -3 * (sc_mmoi[2] - sc_mmoi[0]) * (csdl.reshape(
-                B_from_RTN[2, 0, :] * B_from_RTN[0, 0, :],
-                (1, num_times)) * osculating_orbit_angular_speed**2)
-            bt3[2, :] = -3 * (sc_mmoi[0] - sc_mmoi[1]) * (csdl.reshape(
-                B_from_RTN[0, 0, :] * B_from_RTN[1, 0, :],
-                (1, num_times)) * osculating_orbit_angular_speed**2)
-
-            body_torque = bt1 + bt2 + csdl.reorder_axes(bt3, 'ij->ji')
-        else:
-            body_torque = bt1 + bt2
-        self.register_output('body_torque', body_torque)
+    return rates, body_torque
 
 
-class ReactionWheelDynamics(Model):
-
-    def initialize(self):
-        self.parameters.declare('num_nodes', types=int)
-        self.parameters.declare('rw_mmoi', types=np.ndarray)
-
-    def define(self):
-        n = self.parameters['num_nodes']
-        rw_mmoi = self.parameters['rw_mmoi']
-
-        body_torque = self.declare_variable('body_torque', shape=(n, 3))
-        body_rates = self.declare_variable('body_rates', shape=(n, 3))
-        reaction_wheel_velocity = self.create_input('reaction_wheel_velocity',
-                                                    shape=(n, 3))
-        x = self.create_output('x', shape=(n, 3))
-        x[:, 0] = rw_mmoi[0] * body_rates[:, 0]
-        x[:, 1] = rw_mmoi[1] * body_rates[:, 1]
-        x[:, 2] = rw_mmoi[2] * body_rates[:, 2]
-        dw_dt = csdl.cross(body_rates, x, axis=1) - body_torque
-        self.register_output('dw_dt', dw_dt)
+def reaction_wheel_dynamics(omega, body_rates, body_torque, rw_mmoi):
+    # x = J_rw * omega_body (angular momentum of reaction wheels)
+    x = csdl.Variable(value=np.zeros(3))
+    x = x.set(csdl.slice[0], rw_mmoi[0] * body_rates[0])
+    x = x.set(csdl.slice[1], rw_mmoi[1] * body_rates[1])
+    x = x.set(csdl.slice[2], rw_mmoi[2] * body_rates[2])
+    # dw_dt = omega_body x (J_rw * omega_body) - body_torque
+    dw_dt = csdl.cross(body_rates, x, axis=0) - body_torque
+    return dw_dt
 
 
-class ODEProblemTest(ODEProblem):
+def runge_kutta_4(f, omega0, body_rates_history, body_torque_history, h, n, rw_mmoi):
+    # Preallocate history array and set initial condition
+    omega = omega0
+    omega_history = csdl.Variable(value=np.zeros((n + 1, 3)))
+    omega_history = omega_history.set(csdl.slice[0, :], omega0)
 
-    def setup(self):
-        self.add_parameter('body_torque',
-                           dynamic=True,
-                           shape=(self.num_times, 3))
-        self.add_parameter(
-            'body_rates',
-            dynamic=True,
-            shape=(self.num_times, 3),
-        )
-        self.add_state(
-            'reaction_wheel_velocity',
-            'dw_dt',
-            shape=(3, ),
-            initial_condition_name='initial_reaction_wheel_velocity',
-            output='reaction_wheel_velocity',
-        )
-        self.add_times(step_vector='h')
-        self.set_ode_system(ReactionWheelDynamics)
+    for i in csdl.frange(n):
+        # Look up spacecraft angular velocity and torque at this time step
+        B = body_rates_history[i, :]
+        torque = body_torque_history[i, :]
+
+        # RK4 derivative estimates
+        k1 = f(omega, B, torque, rw_mmoi)
+        k2 = f(omega + 0.5*h*k1, B, torque, rw_mmoi)
+        k3 = f(omega + 0.5*h*k2, B, torque, rw_mmoi)
+        k4 = f(omega + h*k3, B, torque, rw_mmoi)
+
+        # Weighted average update
+        omega = omega + (h/6) * (k1 + 2*k2 + 2*k3 + k4)
+        omega_history = omega_history.set(csdl.slice[i+1, :], omega)
+
+    return omega_history
 
 
-class Attitude(Model):
+def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angular_speed,
+             max_rw_torque=0.004,
+             sc_mmoi=6 * np.array([2, 1, 3]) * 1e-3,
+             rw_mmoi=6 * np.ones(3) * 1e-5,
+             gravity_gradient=True):
 
-    def initialize(self):
-        self.parameters.declare('num_times', types=int)
-        self.parameters.declare('num_cp', types=int)
-        self.parameters.declare('step_size', types=float)
-        self.parameters.declare('max_rw_torque', default=0.004, types=float)
-        self.parameters.declare('max_rw_power', default=1., types=float)
-        # 6U mmoi based on CADRE 3U cubesat
-        self.parameters.declare('sc_mmoi',
-                                default=6 * np.array([2, 1, 3]) * 1e-3,
-                                types=np.ndarray)
-        self.parameters.declare('rw_mmoi',
-                                default=6 * np.ones(3) * 1e-5,
-                                types=np.ndarray)
-        self.parameters.declare('gravity_gradient', types=bool)
+    if sc_mmoi.shape != (3,):
+        raise ValueError('sc_mmoi must have shape (3,); has shape {}'.format(sc_mmoi.shape))
+    if rw_mmoi.shape != (3,):
+        raise ValueError('rw_mmoi must have shape (3,); has shape {}'.format(rw_mmoi.shape))
 
-    def define(self):
-        num_times = self.parameters['num_times']
-        num_cp = self.parameters['num_cp']
-        step_size = self.parameters['step_size']
-        max_rw_torque = self.parameters['max_rw_torque']
-        max_rw_power = self.parameters['max_rw_torque']
-        max_rw_speed = max_rw_power / max_rw_torque
-        gravity_gradient = self.parameters['gravity_gradient']
-        sc_mmoi = self.parameters['sc_mmoi']
-        rw_mmoi = self.parameters['rw_mmoi']
-        if sc_mmoi.shape != (3, ):
-            raise ValueError(
-                'sc_mmoi must have shape (3,); has shape {}'.format(
-                    sc_mmoi.shape))
+    max_rw_speed = 1.0 / max_rw_torque
 
-        if rw_mmoi.shape != (3, ):
-            raise ValueError(
-                'rw_mmoi must have shape (3,); has shape {}'.format(
-                    rw_mmoi.shape))
+    # B-spline control points (design variables)
+    jac = get_bspline_mtx(num_cp, num_times)
 
-        yaw_cp = self.create_input(
-            'yaw_cp',
-            shape=(num_cp, ),
-            val=0,
-        )
-        pitch_cp = self.create_input(
-            'pitch_cp',
-            shape=(num_cp, ),
-            val=0,
-        )
-        roll_cp = self.create_input(
-            'roll_cp',
-            shape=(num_cp, ),
-            val=0,
-        )
-        self.add_design_variable('yaw_cp')
-        self.add_design_variable('pitch_cp')
-        self.add_design_variable('roll_cp')
+    # yaw_cp = csdl.Variable(value=np.zeros(num_cp), name='yaw_cp')
+    yaw_cp = csdl.Variable(value=np.linspace(0, 0.1, num_cp), name='yaw_cp')
+    pitch_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='pitch_cp')
+    roll_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='roll_cp')
+    # pitch_cp = csdl.Variable(value=np.zeros(num_cp), name='pitch_cp')
+    # roll_cp = csdl.Variable(value=np.zeros(num_cp), name='roll_cp')
+    yaw_cp.set_as_design_variable()
+    pitch_cp.set_as_design_variable()
+    roll_cp.set_as_design_variable()
 
-        bspline_mtx = get_bspline_mtx(num_cp, num_times)
-        yaw = csdl.matvec(bspline_mtx, yaw_cp)
-        pitch = csdl.matvec(bspline_mtx, pitch_cp)
-        roll = csdl.matvec(bspline_mtx, roll_cp)
-        yaw = self.register_output('yaw', yaw)
-        pitch = self.register_output('pitch', pitch)
-        roll = self.register_output('roll', roll)
+    yaw_inputs = csdl.VariableGroup()
+    yaw_inputs.yaw_cp = yaw_cp
+    yaw = BsplineComp(num_cp=num_cp, num_pt=num_times, jac=jac,
+                      in_name='yaw_cp', out_name='yaw').evaluate(yaw_inputs).yaw
 
-        self.add(Body123ReferenceFrameChange(num_times=num_times, ), )
-        self.add(
-            OrbitBodyReferenceFrameChange(
-                num_times=num_times,
-                step_size=step_size,
-            ), )
-        self.connect('C', 'B_from_ECI')
-        self.add(
-            BodyRates(
-                num_times=num_times,
-                step_size=step_size,
-                sc_mmoi=sc_mmoi,
-                gravity_gradient=gravity_gradient,
-            ))
+    pitch_inputs = csdl.VariableGroup()
+    pitch_inputs.pitch_cp = pitch_cp
+    pitch = BsplineComp(num_cp=num_cp, num_pt=num_times, jac=jac,
+                        in_name='pitch_cp', out_name='pitch').evaluate(pitch_inputs).pitch
 
-        initial_reaction_wheel_velocity = self.create_input(
-            'initial_reaction_wheel_velocity',
-            shape=(3, ),
-            val=0,
-        )
-        self.add_design_variable(
-            'initial_reaction_wheel_velocity',
-            lower=-max_rw_speed,
-            upper=max_rw_speed,
-        )
+    roll_inputs = csdl.VariableGroup()
+    roll_inputs.roll_cp = roll_cp
+    roll = BsplineComp(num_cp=num_cp, num_pt=num_times, jac=jac,
+                       in_name='roll_cp', out_name='roll').evaluate(roll_inputs).roll
 
-        self.add(
-            # ODEProblemTest('GaussLegendre4', 'collocation',
-            ODEProblemTest('RK4', 'time-marching',
-                           num_times).create_solver_model(
-                               ODE_parameters={'rw_mmoi': rw_mmoi}, ),
-            name='reaction_wheel_speed_integrator',
-        )
-        reaction_wheel_velocity = self.declare_variable(
-            'reaction_wheel_velocity',
-            shape=(num_times, 3),
-        )
+    # Reference frame transformations
+    B_from_ECI = body123_reference_frame_change(yaw, pitch, roll, num_times)
+    B_from_RTN, B_from_ECI_dot = orbit_body_reference_frame_change(RTN_from_ECI, B_from_ECI, num_times, step_size)
+    rates, body_torque = body_rates(B_from_ECI, B_from_ECI_dot, osculating_orbit_angular_speed,
+                                    sc_mmoi, step_size, num_times, gravity_gradient, B_from_RTN)
 
-        # TODO: can we get this from ozone?
-        rw_accel = self.create_output(
-            'rw_accel',
-            shape=(num_times, 3),
-            val=0,
-        )
-        rw_accel[1:, :] = (reaction_wheel_velocity[1:, :] -
-                           reaction_wheel_velocity[:-1, :]) / step_size
+    # Initial reaction wheel velocity (design variable)
+    initial_rw_velocity = csdl.Variable(value=np.zeros(3), name='initial_reaction_wheel_velocity')
+    initial_rw_velocity.set_as_design_variable(lower=-max_rw_speed, upper=max_rw_speed)
 
-        # use reaction wheel torque to compute current draw required for
-        # operation
-        reaction_wheel_torque = self.create_output(
-            'reaction_wheel_torque',
-            shape=(num_times, 3),
-        )
-        reaction_wheel_torque[:, 0] = rw_mmoi[0] * rw_accel[:, 0]
-        reaction_wheel_torque[:, 1] = rw_mmoi[1] * rw_accel[:, 1]
-        reaction_wheel_torque[:, 2] = rw_mmoi[2] * rw_accel[:, 2]
+    # RK4 integration of reaction wheel dynamics
+    rw_velocity_history = runge_kutta_4(
+        reaction_wheel_dynamics,
+        initial_rw_velocity,
+        rates,
+        body_torque,
+        step_size,
+        num_times - 1,
+        rw_mmoi
+    )
 
-        # Each reaction wheel has a maximum torque
-        min_reaction_wheel_torque = csdl.min(
-            # csdl.min(
-            reaction_wheel_torque,
-            # axis=0,
-            # rho=10. / 1e12,
-            # ),
-            # axis=1,
-        )
-        max_reaction_wheel_torque = csdl.max(
-            # csdl.max(
-            reaction_wheel_torque,
-            # axis=0,
-            # rho=10. / 1e13,
-            # ),
-            # axis=1,
-        )
-        self.register_output(
-            'min_reaction_wheel_torque',
-            min_reaction_wheel_torque,
-        )
-        self.register_output(
-            'max_reaction_wheel_torque',
-            max_reaction_wheel_torque,
-        )
-        self.add_constraint(
-            'min_reaction_wheel_torque',
-            lower=-max_rw_torque,
-        )
-        self.add_constraint(
-            'max_reaction_wheel_torque',
-            upper=max_rw_torque,
-        )
+    # Reaction wheel acceleration and torque
+    rw_accel_history = csdl.Variable(value=np.zeros((num_times, 3)))
+    rw_accel_history = rw_accel_history.set(
+        csdl.slice[1:, :],
+        (rw_velocity_history[1:, :] - rw_velocity_history[:-1, :]) / step_size
+    )
+    reaction_wheel_torque = csdl.Variable(value=np.zeros((num_times, 3)))
+    reaction_wheel_torque = reaction_wheel_torque.set(csdl.slice[:, 0], rw_mmoi[0] * rw_accel_history[:, 0])
+    reaction_wheel_torque = reaction_wheel_torque.set(csdl.slice[:, 1], rw_mmoi[1] * rw_accel_history[:, 1])
+    reaction_wheel_torque = reaction_wheel_torque.set(csdl.slice[:, 2], rw_mmoi[2] * rw_accel_history[:, 2])
 
-        # RW rate saturation
-        # rw_speed_min = csdl.min(rw_speed, axis=1, rho=50. / 1e0)
-        # rw_speed_max = csdl.max(rw_speed, axis=1, rho=10. / 1e0)
-        # self.register_output('rw_speed_min', rw_speed_min)
-        # self.register_output('rw_speed_max', rw_speed_max)
-        # self.add_constraint('rw_speed_min', lower=-max_rw_speed)
-        # self.add_constraint('rw_speed_max', upper=max_rw_speed)
+    # Constraints on reaction wheel torque
+    min_rw_torque = csdl.minimum(reaction_wheel_torque)
+    max_rw_torque_val = csdl.maximum(reaction_wheel_torque)
+    min_rw_torque.set_as_constraint(lower=-max_rw_torque)
+    max_rw_torque_val.set_as_constraint(upper=max_rw_torque)
 
-        # NOTE: DEBUGGING DERIVARIVES ONLY -- NEED A SCALAR OBJECTIVE
-        # reaction_wheel_speed = csdl.pnorm(reaction_wheel_velocity )
-        # self.register_output('reaction_wheel_speed',reaction_wheel_speed  )
+    return rw_velocity_history, reaction_wheel_torque, yaw, pitch, roll
 
 
 if __name__ == "__main__":
-    from csdl import GraphRepresentation
-    from python_csdl_backend import Simulator
+    import matplotlib.pyplot as plt
     np.random.seed(0)
 
     num_times = 301
@@ -329,15 +184,69 @@ if __name__ == "__main__":
     duration = 95.
     step_size = duration * 60 / (num_times - 1)
 
-    m = Attitude(
+    recorder = csdl.Recorder(inline=True)
+    recorder.start()
+    RTN_from_ECI = csdl.Variable(
+        value=np.tile(np.eye(3)[:, :, np.newaxis], (1, 1, num_times)),
+        name='RTN_from_ECI'
+    )
+    osculating_orbit_angular_speed = csdl.Variable(
+        value=np.ones((1, num_times)) * 0.001,
+        name='osculating_orbit_angular_speed'
+    )
+
+    rw_vel, rw_torque, yaw, pitch, roll = attitude(
         num_times=num_times,
-        step_size=step_size,
         num_cp=num_cp,
+        step_size=step_size,
+        RTN_from_ECI=RTN_from_ECI,
+        osculating_orbit_angular_speed=osculating_orbit_angular_speed,
         gravity_gradient=True,
     )
-    # m.add_objective('reaction_wheel_speed')
 
-    rep = GraphRepresentation(m)
-    sim = Simulator(rep)
+    recorder.stop()
+
+    sim = csdl.experimental.JaxSimulator(recorder=recorder)
     sim.run()
-    sim.compute_total_derivatives(check_failure=True)
+    sim.check_totals()
+
+    print("Reaction wheel velocity history shape:", rw_vel.value.shape)
+    print("First RW velocity:", rw_vel.value[0, :])
+    print("Last RW velocity:", rw_vel.value[-1, :])
+
+    # Time axis in minutes
+    t_hist = np.arange(num_times) * step_size / 60
+    labels = ['x', 'y', 'z']
+
+    # Plot reaction wheel velocity
+    fig, ax = plt.subplots(3, 1, figsize=(10, 8))
+    for i in range(3):
+        ax[i].plot(t_hist, rw_vel.value[:, i])
+        ax[i].set_ylabel(f'RW velocity {labels[i]} (rad/s)')
+        ax[i].grid(True)
+    ax[-1].set_xlabel('Time (minutes)')
+    ax[0].set_title('Reaction Wheel Velocity History')
+    plt.tight_layout()
+    plt.show()
+
+    # Plot reaction wheel torque
+    fig, ax = plt.subplots(3, 1, figsize=(10, 8))
+    for i in range(3):
+        ax[i].plot(t_hist, rw_torque.value[:, i])
+        ax[i].set_ylabel(f'RW torque {labels[i]} (Nm)')
+        ax[i].grid(True)
+    ax[-1].set_xlabel('Time (minutes)')
+    ax[0].set_title('Reaction Wheel Torque History')
+    plt.tight_layout()
+    plt.show()
+
+    # Plot yaw, pitch, roll
+    fig, ax = plt.subplots(3, 1, figsize=(10, 8))
+    for i, (angle, name) in enumerate(zip([yaw, pitch, roll], ['Yaw', 'Pitch', 'Roll'])):
+        ax[i].plot(t_hist, np.degrees(angle.value))
+        ax[i].set_ylabel(f'{name} (degrees)')
+        ax[i].grid(True)
+    ax[-1].set_xlabel('Time (minutes)')
+    ax[0].set_title('Attitude Angles')
+    plt.tight_layout()
+    plt.show()
