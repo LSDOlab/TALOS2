@@ -108,13 +108,13 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
 
     # B-spline control points (design variables)
     jac = get_bspline_mtx(num_cp, num_times)
-
-    # yaw_cp = csdl.Variable(value=np.zeros(num_cp), name='yaw_cp')
-    yaw_cp = csdl.Variable(value=np.linspace(0, 0.1, num_cp), name='yaw_cp')
-    pitch_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='pitch_cp')
-    roll_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='roll_cp')
-    # pitch_cp = csdl.Variable(value=np.zeros(num_cp), name='pitch_cp')
-    # roll_cp = csdl.Variable(value=np.zeros(num_cp), name='roll_cp')
+    # setting values to test
+    # yaw_cp = csdl.Variable(value=np.linspace(0, 0.1, num_cp), name='yaw_cp')
+    # pitch_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='pitch_cp')
+    # roll_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='roll_cp')
+    yaw_cp = csdl.Variable(value=np.zeros(num_cp), name='yaw_cp')
+    pitch_cp = csdl.Variable(value=np.zeros(num_cp), name='pitch_cp')
+    roll_cp = csdl.Variable(value=np.zeros(num_cp), name='roll_cp')
     yaw_cp.set_as_design_variable()
     pitch_cp.set_as_design_variable()
     roll_cp.set_as_design_variable()
@@ -171,7 +171,8 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
     max_rw_torque_val = csdl.maximum(reaction_wheel_torque)
     min_rw_torque.set_as_constraint(lower=-max_rw_torque)
     max_rw_torque_val.set_as_constraint(upper=max_rw_torque)
-
+    rw_effort = csdl.sum(reaction_wheel_torque ** 2)
+    rw_effort.set_as_objective()
     return rw_velocity_history, reaction_wheel_torque, yaw, pitch, roll
 
 
@@ -206,9 +207,16 @@ if __name__ == "__main__":
 
     recorder.stop()
 
-    sim = csdl.experimental.JaxSimulator(recorder=recorder)
+    # sim = csdl.experimental.JaxSimulator(recorder=recorder)
+    # sim.check_totals()
+    sim = csdl.experimental.PySimulator(recorder)
     sim.run()
-    sim.check_totals()
+
+    from modopt import CSDLAlphaProblem, SLSQP
+    prob = CSDLAlpha(problem_name='attitude_opt', simulator=sim)
+    optimizer = SLSQP(prob, ftol=1e-9, 'maxiter': 100)
+    optimizer.solve()
+    optimizer.print_results()
 
     print("Reaction wheel velocity history shape:", rw_vel.value.shape)
     print("First RW velocity:", rw_vel.value[0, :])
