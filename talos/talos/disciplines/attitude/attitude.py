@@ -213,8 +213,8 @@ if __name__ == "__main__":
     sim.run()
 
     from modopt import CSDLAlphaProblem, SLSQP
-    prob = CSDLAlpha(problem_name='attitude_opt', simulator=sim)
-    optimizer = SLSQP(prob, ftol=1e-9, 'maxiter': 100)
+    prob = CSDLAlphaProblem(problem_name='attitude_opt', simulator=sim)
+    optimizer = SLSQP(prob, ftol=1e-9, maxiter=100)
     optimizer.solve()
     optimizer.print_results()
 
