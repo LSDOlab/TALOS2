@@ -109,15 +109,16 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
     # B-spline control points (design variables)
     jac = get_bspline_mtx(num_cp, num_times)
     # setting values to test
-    # yaw_cp = csdl.Variable(value=np.linspace(0, 0.1, num_cp), name='yaw_cp')
-    # pitch_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='pitch_cp')
-    # roll_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='roll_cp')
-    yaw_cp = csdl.Variable(value=np.zeros(num_cp), name='yaw_cp')
-    pitch_cp = csdl.Variable(value=np.zeros(num_cp), name='pitch_cp')
-    roll_cp = csdl.Variable(value=np.zeros(num_cp), name='roll_cp')
-    yaw_cp.set_as_design_variable()
-    pitch_cp.set_as_design_variable()
-    roll_cp.set_as_design_variable()
+    yaw_cp = csdl.Variable(value=np.linspace(0, 0.1, num_cp), name='yaw_cp')
+    pitch_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='pitch_cp')
+    roll_cp = csdl.Variable(value=np.linspace(0, 0.05, num_cp), name='roll_cp')
+    # yaw_cp = csdl.Variable(value=np.zeros(num_cp), name='yaw_cp')
+    # pitch_cp = csdl.Variable(value=np.zeros(num_cp), name='pitch_cp')
+    # roll_cp = csdl.Variable(value=np.zeros(num_cp), name='roll_cp')
+    # scale these
+    yaw_cp.set_as_design_variable(scaler=1e10)
+    pitch_cp.set_as_design_variable(scaler=1e10)
+    roll_cp.set_as_design_variable(scaler=1e10)
 
     yaw_inputs = csdl.VariableGroup()
     yaw_inputs.yaw_cp = yaw_cp
@@ -133,7 +134,14 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
     roll_inputs.roll_cp = roll_cp
     roll = BsplineComp(num_cp=num_cp, num_pt=num_times, jac=jac,
                        in_name='roll_cp', out_name='roll').evaluate(roll_inputs).roll
-
+    # set final constraints for attitude to force optimization problem towards final target orientation minimizing torque along the way
+    # anytime you add a constraint add a scaler to make it order of magnitude 1
+    #yaw[-1].set_as_constraint(equals=0.1, scaler=10.0)
+    #roll[-1].set_as_constraint(equals=0.05, scaler=20.0)
+    #pitch[-1].set_as_constraint(equals=0.05, scaler=20.0)
+    yaw[-1].set_as_constraint(equals=0)
+    roll[-1].set_as_constraint(equals=0)
+    pitch[-1].set_as_constraint(equals=0)
     # Reference frame transformations
     B_from_ECI = body123_reference_frame_change(yaw, pitch, roll, num_times)
     B_from_RTN, B_from_ECI_dot = orbit_body_reference_frame_change(RTN_from_ECI, B_from_ECI, num_times, step_size)
@@ -142,7 +150,7 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
 
     # Initial reaction wheel velocity (design variable)
     initial_rw_velocity = csdl.Variable(value=np.zeros(3), name='initial_reaction_wheel_velocity')
-    initial_rw_velocity.set_as_design_variable(lower=-max_rw_speed, upper=max_rw_speed)
+   # initial_rw_velocity.set_as_design_variable(lower=-max_rw_speed, upper=max_rw_speed)
 
     # RK4 integration of reaction wheel dynamics
     rw_velocity_history = runge_kutta_4(
@@ -167,12 +175,13 @@ def attitude(num_times, num_cp, step_size, RTN_from_ECI, osculating_orbit_angula
     reaction_wheel_torque = reaction_wheel_torque.set(csdl.slice[:, 2], rw_mmoi[2] * rw_accel_history[:, 2])
 
     # Constraints on reaction wheel torque
+    # min and max need to be adjusted
     min_rw_torque = csdl.minimum(reaction_wheel_torque)
     max_rw_torque_val = csdl.maximum(reaction_wheel_torque)
-    min_rw_torque.set_as_constraint(lower=-max_rw_torque)
-    max_rw_torque_val.set_as_constraint(upper=max_rw_torque)
+    min_rw_torque.set_as_constraint(lower=-max_rw_torque, scaler=1e150)
+    max_rw_torque_val.set_as_constraint(upper=max_rw_torque, scaler=1e150)
     rw_effort = csdl.sum(reaction_wheel_torque ** 2)
-    rw_effort.set_as_objective()
+    rw_effort.set_as_objective(scaler=1e20)
     return rw_velocity_history, reaction_wheel_torque, yaw, pitch, roll
 
 
@@ -214,7 +223,13 @@ if __name__ == "__main__":
 
     from modopt import CSDLAlphaProblem, SLSQP
     prob = CSDLAlphaProblem(problem_name='attitude_opt', simulator=sim)
-    optimizer = SLSQP(prob, ftol=1e-9, maxiter=100)
+    optimizer = SLSQP(prob, solver_options={'ftol': 1e-9, 'maxiter': 100})
+
+
+    #print("Initial design variables:", prob.x0)
+   # print("Initial objective:", prob.f_s)
+    #print("Initial constraints:", prob.c_s)
+
     optimizer.solve()
     optimizer.print_results()
 
